@@ -87,14 +87,6 @@ cd ~/inference-engine
 ./benchmarks/bench.sh
 ```
 
-This syncs the run directory, `history.csv`, and generated charts back to the local checkout after a successful benchmark. To make sync failure fail the whole benchmark, run with `BENCH_SYNC_REQUIRED=1`.
-
-If local port `8080` is already in use, pick another local port for forwarding, for example:
-
-```bash
-ssh -p PORT root@HOST -L 8081:localhost:3000 -R 2222:localhost:22
-```
-
 The benchmark is intentionally fixed:
 
 - Model: Llama 3.2 3B
@@ -110,7 +102,9 @@ The benchmark is intentionally fixed:
 
 | Run | Date | Platform | Precision | Model | Optimization | tok/s | TTFT p50 (s) | TTFT p95 (s) | TPOT p50 (s) | TPOT p95 (s) | E2E p50 (s) | E2E p95 (s) | Requests | Errors | Notes |
 |---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| t1-darwin_arm64_cpu | 2026-06-29 | darwin_arm64_cpu | F32 | Llama 3.2 3B | CPU baseline | 2.09 | 4.131 | 4.547 | 0.4792 | 0.4842 | 126.319 | 127.671 | 5 | 0 | Candle CPU path, F32 weights, engine-native token accounting |
+| t1-darwin_arm64_cpu | 2026-06-29 | darwin_arm64_cpu | F32 | Llama 3.2 3B | CPU baseline | 2.09 | 4.131 | 4.547 | 0.4792 | 0.4842 | 126.319 | 127.671 | 5 | 0 | Candle CPU path, F32 weights |
+| t2-m3_metal | 2026-06-29 | m3_metal | BF16 | Llama 3.2 3B | Metal baseline | 30.56 | 0.517 | 0.607 | 0.0324 | 0.0333 | 8.904 | 8.999 | 5 | 0 | Candle Metal path, |
+| t3-nvidia_geforce_rtx_5090_cuda | 2026-06-29 | nvidia_geforce_rtx_5090_cuda | BF16 | Llama 3.2 3B | CUDA baseline | 101.40 | 0.037 | 0.038 | 0.0099 | 0.0099 | 2.552 | 2.554 | 5 | 0 | Candle CUDA path |
 
 ## License
 
