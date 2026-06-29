@@ -15,6 +15,7 @@
 //   cargo run -- --serve --port 8080
 
 mod api;
+mod llama;
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -24,13 +25,14 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::{
-    generation::LogitsProcessor,
-    models::llama::{Cache, Llama, LlamaConfig, LlamaEosToks},
-};
+use candle_transformers::generation::LogitsProcessor;
 use clap::Parser;
-use hf_hub::api::sync::{Api, ApiRepo};
+use hf_hub::api::sync::{ApiBuilder, ApiRepo};
+use llama::{Cache, Llama, LlamaConfig, LlamaEosToks};
 use tokenizers::Tokenizer;
+
+#[cfg(all(feature = "cuda", feature = "metal"))]
+compile_error!("features `cuda` and `metal` are mutually exclusive");
 
 // ── shared config ────────────────────────────────────────────────────────────
 
@@ -73,7 +75,7 @@ impl Default for GenConfig {
 
 pub(crate) struct LoadedModel {
     llama: Llama,
-    model_config: candle_transformers::models::llama::Config,
+    model_config: llama::Config,
     dtype: DType,
     tokenizer: Tokenizer,
     eos_token_id: Option<LlamaEosToks>,
@@ -83,8 +85,7 @@ pub(crate) struct LoadedModel {
 impl LoadedModel {
     /// Create a fresh KV cache for a new generation request.
     pub(crate) fn new_cache(&self) -> Result<Cache> {
-        Cache::new(true, self.dtype, &self.model_config, &self.device)
-            .map_err(anyhow::Error::from)
+        Cache::new(true, self.dtype, &self.model_config, &self.device).map_err(anyhow::Error::from)
     }
 }
 
@@ -99,8 +100,7 @@ impl LoadedModel {
 /// We collect the unique file names and download each one.
 fn load_safetensors_shards(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
     let index_path = repo.get("model.safetensors.index.json")?;
-    let json: serde_json::Value =
-        serde_json::from_reader(std::fs::File::open(index_path)?)?;
+    let json: serde_json::Value = serde_json::from_reader(std::fs::File::open(index_path)?)?;
 
     let weight_map = json["weight_map"]
         .as_object()
@@ -116,12 +116,24 @@ fn load_safetensors_shards(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
     files.iter().map(|name| Ok(repo.get(name)?)).collect()
 }
 
+fn hf_token_from_env() -> Option<String> {
+    std::env::var("HF_TOKEN")
+        .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
 pub(crate) fn load_model(device: &Device) -> Result<LoadedModel> {
-    let dtype = DType::BF16; // meta-llama/Llama-3.2-3B is BF16
+    let dtype = if matches!(device, Device::Cpu) {
+        DType::F32
+    } else {
+        DType::BF16 // meta-llama/Llama-3.2-3B weights are BF16; CPU matmul needs F32.
+    };
 
     println!("downloading model from HuggingFace ({MODEL_ID})...");
 
-    let api = Api::new()?;
+    let api = ApiBuilder::new().with_token(hf_token_from_env()).build()?;
     let repo = api.model(MODEL_ID.to_string());
     let tokenizer_path = repo.get("tokenizer.json")?;
     let config_path = repo.get("config.json")?;
@@ -130,8 +142,7 @@ pub(crate) fn load_model(device: &Device) -> Result<LoadedModel> {
     let model_paths = load_safetensors_shards(&repo)
         .unwrap_or_else(|_| vec![repo.get("model.safetensors").unwrap()]);
 
-    let model_config: LlamaConfig =
-        serde_json::from_slice(&std::fs::read(config_path)?)?;
+    let model_config: LlamaConfig = serde_json::from_slice(&std::fs::read(config_path)?)?;
     let config = model_config.into_config(false);
 
     println!("loading model weights into memory...");
@@ -160,6 +171,8 @@ pub(crate) fn load_model(device: &Device) -> Result<LoadedModel> {
 // ── generation ───────────────────────────────────────────────────────────────
 
 pub(crate) struct GenMetrics {
+    pub prompt_tokens: u32,
+    pub generated_tokens: u32,
     pub ttft: Duration,
     pub decode_tokens: u32,
     pub total_time: Duration,
@@ -185,16 +198,17 @@ pub(crate) fn generate(
         .map_err(|e| anyhow::anyhow!("encoding failed: {e}"))?
         .get_ids()
         .to_vec();
+    let prompt_tokens = tokens.len() as u32;
 
     // temperature scaling + top-p / argmax sampling
-    let mut sampler =
-        LogitsProcessor::new(gen_cfg.seed, Some(gen_cfg.temperature), None);
+    let mut sampler = LogitsProcessor::new(gen_cfg.seed, Some(gen_cfg.temperature), None);
 
     // absolute position in the sequence (used as the KV cache index)
     let mut pos = 0;
 
     let start = Instant::now();
     let mut ttft = None;
+    let mut generated_tokens = 0u32;
     let mut decode_tokens = 0u32;
 
     for step in 0..gen_cfg.max_new_tokens {
@@ -207,14 +221,13 @@ pub(crate) fn generate(
         let recent = &tokens[tokens.len() - context_len..];
         let input = Tensor::new(recent, &model.device)?.unsqueeze(0)?; // [1, seq]
 
-        let logits = model
-            .llama
-            .forward(&input, cache_index, cache)?;
+        let logits = model.llama.forward(&input, cache_index, cache)?;
         let logits = logits.squeeze(0)?; // [seq, vocab] → [vocab]
         pos += context_len;
 
         let next_token = sampler.sample(&logits)?;
         tokens.push(next_token);
+        generated_tokens += 1;
 
         // record TTFT after prefill + first token sample
         if step == 0 {
@@ -240,10 +253,29 @@ pub(crate) fn generate(
 
     let total = start.elapsed();
     Ok(GenMetrics {
+        prompt_tokens,
+        generated_tokens,
         ttft: ttft.unwrap_or_default(),
         decode_tokens,
         total_time: total,
     })
+}
+
+fn select_device() -> Result<Device> {
+    #[cfg(feature = "cuda")]
+    {
+        return Ok(Device::new_cuda(0)?);
+    }
+
+    #[cfg(feature = "metal")]
+    {
+        return Ok(Device::new_metal(0)?);
+    }
+
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    {
+        Ok(Device::Cpu)
+    }
 }
 
 // ── entrypoint ───────────────────────────────────────────────────────────────
@@ -252,10 +284,7 @@ pub(crate) fn generate(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // --- device selection -------------------------------------------
-    // let device = Device::Cpu; // CPU fallback
-    let device = Device::new_metal(0)?; // Apple Silicon
-    // let device = Device::new_cuda(0)?; // NVIDIA GPU
+    let device = select_device()?;
     println!("device: {device:?}");
 
     let mut model = load_model(&device)?;
@@ -280,8 +309,7 @@ async fn main() -> Result<()> {
         println!("  TTFT        {:8.1?}", metrics.ttft);
         if metrics.decode_tokens > 0 {
             let decode_time = metrics.total_time - metrics.ttft;
-            let tok_s =
-                metrics.decode_tokens as f64 / decode_time.as_secs_f64();
+            let tok_s = metrics.decode_tokens as f64 / decode_time.as_secs_f64();
             println!(
                 "  decode      {:5} tokens in {:8.1?}  ({:.1} tok/s)",
                 metrics.decode_tokens, decode_time, tok_s

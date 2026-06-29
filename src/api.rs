@@ -4,24 +4,26 @@
 // plus `GET /health` and `GET /v1/models` for compatibility.
 
 use std::convert::Infallible;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::sse::{Event, Sse},
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
+use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 use crate::MODEL_ID;
-use crate::{GenConfig, LoadedModel, generate};
+use crate::{GenConfig, GenMetrics, LoadedModel, generate};
 
 // ── request types ────────────────────────────────────────────────────────────
 
@@ -40,9 +42,15 @@ pub(crate) struct ChatCompletionRequest {
     pub seed: u64,
 }
 
-fn default_max_tokens() -> usize { 256 }
-fn default_temperature() -> f64 { 0.8 }
-fn default_seed() -> u64 { 42 }
+fn default_max_tokens() -> usize {
+    256
+}
+fn default_temperature() -> f64 {
+    0.8
+}
+fn default_seed() -> u64 {
+    42
+}
 
 #[derive(Deserialize)]
 pub(crate) struct Message {
@@ -89,6 +97,72 @@ struct ModelEntry {
 struct ModelList {
     object: String,
     data: Vec<ModelEntry>,
+}
+
+#[derive(Serialize)]
+struct EngineMetricsRecord {
+    request_id: String,
+    model: String,
+    prompt_tokens: u32,
+    generated_tokens: u32,
+    max_new_tokens: usize,
+    ttft_s: f64,
+    decode_s: f64,
+    decode_tokens: u32,
+    decode_tok_s: f64,
+    total_s: f64,
+    total_tok_s: f64,
+}
+
+fn write_engine_metrics(
+    request_id: String,
+    model: String,
+    max_new_tokens: usize,
+    metrics: GenMetrics,
+) {
+    let Ok(path) = std::env::var("ENGINE_METRICS_FILE") else {
+        return;
+    };
+
+    let total_s = metrics.total_time.as_secs_f64();
+    let ttft_s = metrics.ttft.as_secs_f64();
+    let decode_s = (metrics.total_time - metrics.ttft).as_secs_f64();
+    let decode_tok_s = if decode_s > 0.0 {
+        metrics.decode_tokens as f64 / decode_s
+    } else {
+        0.0
+    };
+    let total_tok_s = if total_s > 0.0 {
+        metrics.generated_tokens as f64 / total_s
+    } else {
+        0.0
+    };
+
+    let record = EngineMetricsRecord {
+        request_id,
+        model,
+        prompt_tokens: metrics.prompt_tokens,
+        generated_tokens: metrics.generated_tokens,
+        max_new_tokens,
+        ttft_s,
+        decode_s,
+        decode_tokens: metrics.decode_tokens,
+        decode_tok_s,
+        total_s,
+        total_tok_s,
+    };
+
+    let Ok(line) = serde_json::to_string(&record) else {
+        return;
+    };
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut file) => {
+            if let Err(e) = writeln!(file, "{line}") {
+                eprintln!("engine metrics write failed: {e}");
+            }
+        }
+        Err(e) => eprintln!("engine metrics open failed: {e}"),
+    }
 }
 
 // ── chat template ───────────────────────────────────────────────────────────
@@ -161,7 +235,11 @@ async fn chat_completions(
     let gen_cfg = GenConfig {
         max_new_tokens: req.max_tokens,
         seed: req.seed,
-        temperature: if req.temperature <= 0.0 { 1e-6 } else { req.temperature },
+        temperature: if req.temperature <= 0.0 {
+            1e-6
+        } else {
+            req.temperature
+        },
     };
 
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
@@ -177,6 +255,9 @@ async fn chat_completions(
     let state_arc = state.clone();
     let id_for_thread = completion_id.clone();
     let model_name_for_thread = model_name.clone();
+    let metrics_request_id = completion_id.clone();
+    let metrics_model_name = model_name.clone();
+    let metrics_max_new_tokens = gen_cfg.max_new_tokens;
 
     // Run generation on a blocking thread so it doesn't stall the async runtime
     tokio::task::spawn_blocking(move || {
@@ -189,15 +270,18 @@ async fn chat_completions(
                 return;
             }
         };
-        let _ = generate(
-            &mut model,
-            &mut cache,
-            &prompt,
-            &gen_cfg,
-            &mut |text| {
-                let _ = tx.send(text.to_string());
-            },
-        );
+        let metrics = generate(&mut model, &mut cache, &prompt, &gen_cfg, &mut |text| {
+            let _ = tx.send(text.to_string());
+        });
+        match metrics {
+            Ok(metrics) => write_engine_metrics(
+                metrics_request_id,
+                metrics_model_name,
+                metrics_max_new_tokens,
+                metrics,
+            ),
+            Err(e) => eprintln!("generation failed: {e}"),
+        }
         // tx dropped here → channel closes → SSE stream ends
     });
 
@@ -218,8 +302,7 @@ async fn chat_completions(
         }],
     };
 
-    let role_event = Event::default()
-        .data(serde_json::to_string(&role_chunk).unwrap());
+    let role_event = Event::default().data(serde_json::to_string(&role_chunk).unwrap());
 
     // Step 2: token stream from generation
     let id1 = completion_id.clone();
@@ -260,8 +343,7 @@ async fn chat_completions(
         }],
     };
 
-    let stop_event = Event::default()
-        .data(serde_json::to_string(&stop_chunk).unwrap());
+    let stop_event = Event::default().data(serde_json::to_string(&stop_chunk).unwrap());
 
     let done_event = Event::default().data("[DONE]");
 

@@ -151,6 +151,111 @@ def extract_row(
     }
 
 
+def quantile(values: list[float], q: float) -> float:
+    if not values:
+        raise ValueError("cannot compute quantile of empty values")
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * q
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def load_engine_metrics(path: Path) -> list[dict[str, Any]]:
+    rows = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            if not isinstance(data, dict):
+                raise ValueError(f"{path} contained a non-object JSONL row")
+            rows.append(data)
+    return rows
+
+
+def apply_engine_metrics(row: dict[str, Any], metrics_path: Path | None) -> None:
+    if metrics_path is None:
+        return
+    if not metrics_path.exists():
+        raise FileNotFoundError(
+            f"engine metrics file not found: {metrics_path}. "
+            "The server likely failed before completing generation; check server logs above."
+        )
+
+    metrics = load_engine_metrics(metrics_path)
+    if not metrics:
+        raise ValueError(
+            f"engine metrics file is empty: {metrics_path}. "
+            "The server likely failed before completing generation; check server logs above."
+        )
+    completed_requests = int(row["completed_requests"])
+    if len(metrics) < completed_requests:
+        raise ValueError(
+            f"{metrics_path} has {len(metrics)} engine metric rows, "
+            f"but {completed_requests} completed requests were reported"
+        )
+
+    # Warmup requests are logged before LLMPerf requests; keep the measured tail.
+    measured = metrics[-completed_requests:]
+
+    generated_tokens = [float(metric["generated_tokens"]) for metric in measured]
+    decode_tokens = [float(metric["decode_tokens"]) for metric in measured]
+    decode_seconds = [float(metric["decode_s"]) for metric in measured]
+    decode_tok_s = [float(metric["decode_tok_s"]) for metric in measured]
+    decode_tpot = [
+        seconds / tokens
+        for seconds, tokens in zip(decode_seconds, decode_tokens)
+        if tokens > 0.0
+    ]
+
+    total_decode_tokens = sum(decode_tokens)
+    total_decode_seconds = sum(decode_seconds)
+    row["output_tok_s"] = (
+        total_decode_tokens / total_decode_seconds
+        if total_decode_seconds > 0.0
+        else 0.0
+    )
+    row["request_tok_s_p50"] = quantile(decode_tok_s, 0.50)
+    row["request_tok_s_p95"] = quantile(decode_tok_s, 0.95)
+    row["tpot_p50_s"] = quantile(decode_tpot, 0.50)
+    row["tpot_p95_s"] = quantile(decode_tpot, 0.95)
+    row["tpot_p99_s"] = quantile(decode_tpot, 0.99)
+    row["output_tokens_mean"] = sum(generated_tokens) / len(generated_tokens)
+    row["output_tokens_p50"] = quantile(generated_tokens, 0.50)
+    row["output_tokens_p95"] = quantile(generated_tokens, 0.95)
+
+    print(
+        "    engine metrics applied: "
+        f"{completed_requests} measured requests, "
+        f"{row['output_tok_s']:.2f} decode tok/s, "
+        f"generated tokens p50={row['output_tokens_p50']:.0f}"
+    )
+
+
+def validate_output_tokens(row: dict[str, Any], min_output_tokens: int | None) -> None:
+    if min_output_tokens is None:
+        return
+
+    output_p50 = float(row["output_tokens_p50"])
+    output_mean = float(row["output_tokens_mean"])
+    if output_p50 < min_output_tokens:
+        raise SystemExit(
+            "error: output-token validation failed: "
+            f"p50={output_p50:.1f}, mean={output_mean:.1f}, required_p50>={min_output_tokens}. "
+            "This run likely stopped early and is not comparable with the fixed benchmark series."
+        )
+
+    print(
+        "    output-token validation passed: "
+        f"p50={output_p50:.1f}, mean={output_mean:.1f}, required_p50>={min_output_tokens}"
+    )
+
+
 def read_history(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -288,6 +393,18 @@ def main() -> None:
     parser.add_argument("--change", default=None, help="Optional short change key, e.g. flash_attention.")
     parser.add_argument("--run-label", default=None, help="Short x-axis label, e.g. t1-m3_metal.")
     parser.add_argument("--precision", default=None, help="Precision label for the history row.")
+    parser.add_argument(
+        "--min-output-tokens",
+        type=int,
+        default=None,
+        help="Fail if the run's p50 generated output-token count is below this floor.",
+    )
+    parser.add_argument(
+        "--engine-metrics",
+        type=Path,
+        default=None,
+        help="Optional JSONL file of server-side engine metrics to use for token throughput/counts.",
+    )
     args = parser.parse_args()
 
     if args.check_trial_id:
@@ -305,6 +422,8 @@ def main() -> None:
         args.run_label,
         args.precision,
     )
+    apply_engine_metrics(row, args.engine_metrics)
+    validate_output_tokens(row, args.min_output_tokens)
     rows = upsert_history(args.history, row)
     render_chart(args.chart, rows)
 
