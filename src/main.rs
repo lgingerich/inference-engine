@@ -8,6 +8,18 @@
 //   2. Accept the license at https://huggingface.co/meta-llama/Llama-3.2-3B
 //
 // The model is ~6 GB. First run downloads it (~1-5 min depending on connection).
+//
+// Modes:
+//   cargo run                       — single prompt, prints timing
+//   cargo run -- --serve            — OpenAI-compatible HTTP API on :3000
+//   cargo run -- --serve --port 8080
+
+mod api;
+
+use std::collections::HashSet;
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
@@ -16,36 +28,64 @@ use candle_transformers::{
     generation::LogitsProcessor,
     models::llama::{Cache, Llama, LlamaConfig, LlamaEosToks},
 };
+use clap::Parser;
 use hf_hub::api::sync::{Api, ApiRepo};
-use std::collections::HashSet;
-use std::io::Write;
-use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
 // ── shared config ────────────────────────────────────────────────────────────
 
-const MODEL_ID: &str = "meta-llama/Llama-3.2-3B";
+pub(crate) const MODEL_ID: &str = "meta-llama/Llama-3.2-3B";
 
-struct GenConfig {
-    max_new_tokens: usize,
-    seed: u64,
-    temperature: f64,
+#[derive(Parser)]
+#[command(name = "infer")]
+struct Cli {
+    /// Run as an HTTP server instead of a single prompt
+    #[arg(long)]
+    serve: bool,
+
+    /// Port for the HTTP server
+    #[arg(long, default_value = "3000")]
+    port: u16,
+
+    /// Prompt to generate from (CLI mode only)
+    #[arg(long, default_value = "Once upon a time, ")]
+    prompt: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct GenConfig {
+    pub max_new_tokens: usize,
+    pub seed: u64,
+    pub temperature: f64,
 }
 
 impl Default for GenConfig {
     fn default() -> Self {
-        Self { max_new_tokens: 100, seed: 42, temperature: 0.8 }
+        Self {
+            max_new_tokens: 100,
+            seed: 42,
+            temperature: 0.8,
+        }
     }
 }
 
 // ── model loading ────────────────────────────────────────────────────────────
 
-struct LoadedModel {
+pub(crate) struct LoadedModel {
     llama: Llama,
-    cache: Cache,
+    model_config: candle_transformers::models::llama::Config,
+    dtype: DType,
     tokenizer: Tokenizer,
     eos_token_id: Option<LlamaEosToks>,
     device: Device,
+}
+
+impl LoadedModel {
+    /// Create a fresh KV cache for a new generation request.
+    pub(crate) fn new_cache(&self) -> Result<Cache> {
+        Cache::new(true, self.dtype, &self.model_config, &self.device)
+            .map_err(anyhow::Error::from)
+    }
 }
 
 /// Download config/weights/tokenizer from HuggingFace, build the model + KV cache.
@@ -76,9 +116,8 @@ fn load_safetensors_shards(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
     files.iter().map(|name| Ok(repo.get(name)?)).collect()
 }
 
-fn load_model() -> Result<LoadedModel> {
-    let device = Device::Cpu; // switch to Device::Cuda(0) once CUDA is wired up
-    let dtype = DType::F16; // half-precision: 6 GB instead of 12 GB of VRAM
+pub(crate) fn load_model(device: &Device) -> Result<LoadedModel> {
+    let dtype = DType::BF16; // meta-llama/Llama-3.2-3B is BF16
 
     println!("downloading model from HuggingFace ({MODEL_ID})...");
 
@@ -91,17 +130,16 @@ fn load_model() -> Result<LoadedModel> {
     let model_paths = load_safetensors_shards(&repo)
         .unwrap_or_else(|_| vec![repo.get("model.safetensors").unwrap()]);
 
-    let config: LlamaConfig = serde_json::from_slice(&std::fs::read(config_path)?)?;
-    let config = config.into_config(false);
+    let model_config: LlamaConfig =
+        serde_json::from_slice(&std::fs::read(config_path)?)?;
+    let config = model_config.into_config(false);
 
     println!("loading model weights into memory...");
 
     // mmap-backed: weights demand-paged by the OS, no upfront copy
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_paths, dtype, &device)? };
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_paths, dtype, device)? };
     let llama = Llama::load(vb, &config)?;
 
-    // pre-allocate KV cache buffers for the full context window
-    let cache = Cache::new(true, dtype, &config, &device)?;
     let eos_token_id = config.eos_token_id.clone();
 
     println!("loading tokenizer...");
@@ -109,17 +147,38 @@ fn load_model() -> Result<LoadedModel> {
     let tokenizer = Tokenizer::from_file(tokenizer_path)
         .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
 
-    Ok(LoadedModel { llama, cache, tokenizer, eos_token_id, device })
+    Ok(LoadedModel {
+        llama,
+        model_config: config,
+        dtype,
+        tokenizer,
+        eos_token_id,
+        device: device.clone(),
+    })
 }
 
-// ── generation loop ──────────────────────────────────────────────────────────
+// ── generation ───────────────────────────────────────────────────────────────
+
+pub(crate) struct GenMetrics {
+    pub ttft: Duration,
+    pub decode_tokens: u32,
+    pub total_time: Duration,
+}
 
 /// Autoregressive generation with KV-cache acceleration.
 ///
 /// Prefill (1st step): feeds the entire prompt through the model; KV cache is populated.
 /// Decode (remaining steps): only the single newest token passes through;
 /// past keys and values are served from the cache — O(n) per step instead of O(n²).
-fn generate(model: &mut LoadedModel, prompt: &str, gen_cfg: &GenConfig) -> Result<()> {
+///
+/// Calls `on_token` with each decoded text fragment as it streams.
+pub(crate) fn generate(
+    model: &mut LoadedModel,
+    cache: &mut Cache,
+    prompt: &str,
+    gen_cfg: &GenConfig,
+    on_token: &mut dyn FnMut(&str),
+) -> Result<GenMetrics> {
     let mut tokens = model
         .tokenizer
         .encode(prompt, true)
@@ -128,13 +187,15 @@ fn generate(model: &mut LoadedModel, prompt: &str, gen_cfg: &GenConfig) -> Resul
         .to_vec();
 
     // temperature scaling + top-p / argmax sampling
-    let mut sampler = LogitsProcessor::new(gen_cfg.seed, Some(gen_cfg.temperature), None);
-
-    print!("{prompt}");
-    std::io::stdout().flush()?;
+    let mut sampler =
+        LogitsProcessor::new(gen_cfg.seed, Some(gen_cfg.temperature), None);
 
     // absolute position in the sequence (used as the KV cache index)
     let mut pos = 0;
+
+    let start = Instant::now();
+    let mut ttft = None;
+    let mut decode_tokens = 0u32;
 
     for step in 0..gen_cfg.max_new_tokens {
         let (context_len, cache_index) = if step == 0 {
@@ -146,12 +207,21 @@ fn generate(model: &mut LoadedModel, prompt: &str, gen_cfg: &GenConfig) -> Resul
         let recent = &tokens[tokens.len() - context_len..];
         let input = Tensor::new(recent, &model.device)?.unsqueeze(0)?; // [1, seq]
 
-        let logits = model.llama.forward(&input, cache_index, &mut model.cache)?;
+        let logits = model
+            .llama
+            .forward(&input, cache_index, cache)?;
         let logits = logits.squeeze(0)?; // [seq, vocab] → [vocab]
         pos += context_len;
 
         let next_token = sampler.sample(&logits)?;
         tokens.push(next_token);
+
+        // record TTFT after prefill + first token sample
+        if step == 0 {
+            ttft = Some(start.elapsed());
+        } else {
+            decode_tokens += 1;
+        }
 
         // halt on EOS
         match &model.eos_token_id {
@@ -160,23 +230,66 @@ fn generate(model: &mut LoadedModel, prompt: &str, gen_cfg: &GenConfig) -> Resul
             _ => {}
         }
 
-        // decode one token → text and stream to stdout
+        // decode one token → text and stream to caller
         let text = model
             .tokenizer
             .decode(&[next_token], false)
             .map_err(|e| anyhow::anyhow!("decoding failed: {e}"))?;
-        print!("{text}");
-        std::io::stdout().flush()?;
+        on_token(&text);
     }
 
-    println!();
-    Ok(())
+    let total = start.elapsed();
+    Ok(GenMetrics {
+        ttft: ttft.unwrap_or_default(),
+        decode_tokens,
+        total_time: total,
+    })
 }
 
 // ── entrypoint ───────────────────────────────────────────────────────────────
 
-fn main() -> Result<()> {
-    let mut model = load_model()?;
-    let gen_cfg = GenConfig::default();
-    generate(&mut model, "Once upon a time, ", &gen_cfg)
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // --- device selection -------------------------------------------
+    // let device = Device::Cpu; // CPU fallback
+    let device = Device::new_metal(0)?; // Apple Silicon
+    // let device = Device::new_cuda(0)?; // NVIDIA GPU
+    println!("device: {device:?}");
+
+    let mut model = load_model(&device)?;
+
+    if cli.serve {
+        api::serve(model, cli.port).await?;
+    } else {
+        // ── CLI single-prompt mode ──────────────────────────────────────────
+        print!("{}", cli.prompt);
+        std::io::stdout().flush()?;
+
+        let gen_cfg = GenConfig::default();
+        let mut cache = model.new_cache()?;
+        let metrics = generate(&mut model, &mut cache, &cli.prompt, &gen_cfg, &mut |text| {
+            print!("{text}");
+            std::io::stdout().flush().ok();
+        })?;
+
+        // ── benchmark printout ──────────────────────────────────────────────
+        println!();
+        println!("──── metrics ──────────────────────────────");
+        println!("  TTFT        {:8.1?}", metrics.ttft);
+        if metrics.decode_tokens > 0 {
+            let decode_time = metrics.total_time - metrics.ttft;
+            let tok_s =
+                metrics.decode_tokens as f64 / decode_time.as_secs_f64();
+            println!(
+                "  decode      {:5} tokens in {:8.1?}  ({:.1} tok/s)",
+                metrics.decode_tokens, decode_time, tok_s
+            );
+        }
+        println!("  total wall  {:8.1?}", metrics.total_time);
+        println!("─────────────────────────────────────────────");
+    }
+
+    Ok(())
 }

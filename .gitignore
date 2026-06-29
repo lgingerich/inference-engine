@@ -9,6 +9,9 @@ __pycache__/
 .venv/
 venv/
 
+# Benchmark results (local only, not committed)
+benchmarks/results/
+
 # uv
 uv.lock
 
