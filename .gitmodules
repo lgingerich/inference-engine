@@ -1,0 +1,3 @@
+[submodule "benchmarks/llmperf"]
+	path = benchmarks/llmperf
+	url = https://github.com/ray-project/llmperf.git
